@@ -182,6 +182,174 @@ def thicken_lines(
             to_save.save(output_path, **save_kwargs)
 
 
+def _circular_structure(radius: int) -> np.ndarray:
+    """Elemento estructurante circular (disco) para morfología."""
+    if radius <= 0:
+        return np.ones((1, 1), dtype=bool)
+    k = radius * 2 + 1
+    c = k // 2
+    y, x = np.ogrid[:k, :k]
+    return ((x - c) ** 2 + (y - c) ** 2 <= radius * radius)
+
+
+def _binary_fill_holes_numpy(mask: np.ndarray) -> np.ndarray:
+    """Rellena agujeros en una máscara booleana (True = tinta). Sin scipy."""
+    mask = mask.astype(bool)
+    if not mask.any():
+        return mask.copy()
+    h, w = mask.shape
+    visited = np.zeros((h, w), dtype=bool)
+    stack: list[tuple[int, int]] = []
+    for x in range(w):
+        if not mask[0, x]:
+            stack.append((0, x))
+        if not mask[h - 1, x]:
+            stack.append((h - 1, x))
+    for y in range(h):
+        if not mask[y, 0]:
+            stack.append((y, 0))
+        if not mask[y, w - 1]:
+            stack.append((y, w - 1))
+    while stack:
+        y, x = stack.pop()
+        if visited[y, x] or mask[y, x]:
+            continue
+        visited[y, x] = True
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and not visited[ny, nx] and not mask[ny, nx]:
+                stack.append((ny, nx))
+    holes = (~mask) & (~visited)
+    filled = mask.copy()
+    filled[holes] = True
+    return filled
+
+
+def _binary_fill_holes(mask: np.ndarray) -> np.ndarray:
+    try:
+        from scipy import ndimage
+        return ndimage.binary_fill_holes(mask.astype(bool))
+    except ImportError:
+        return _binary_fill_holes_numpy(mask)
+
+
+def _binary_dilate(mask: np.ndarray, radius: int) -> np.ndarray:
+    struct = _circular_structure(radius)
+    m = mask.astype(bool)
+    try:
+        from scipy import ndimage
+        return ndimage.binary_dilation(m, structure=struct)
+    except ImportError:
+        return _binary_dilate_manual(m, struct)
+
+
+def _binary_erode(mask: np.ndarray, radius: int) -> np.ndarray:
+    struct = _circular_structure(radius)
+    m = mask.astype(bool)
+    try:
+        from scipy import ndimage
+        return ndimage.binary_erosion(m, structure=struct)
+    except ImportError:
+        return _binary_erode_manual(m, struct)
+
+
+def _binary_dilate_manual(mask: np.ndarray, struct: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    kh, kw = struct.shape
+    cy, cx = kh // 2, kw // 2
+    out = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.where(struct)
+    for y in range(h):
+        for x in range(w):
+            if not mask[y, x]:
+                continue
+            for dy, dx in zip(ys - cy, xs - cx):
+                ny, nx = y + dy, x + dx
+                if 0 <= ny < h and 0 <= nx < w:
+                    out[ny, nx] = True
+    return out
+
+
+def _binary_erode_manual(mask: np.ndarray, struct: np.ndarray) -> np.ndarray:
+    h, w = mask.shape
+    kh, kw = struct.shape
+    cy, cx = kh // 2, kw // 2
+    out = np.zeros_like(mask, dtype=bool)
+    ys, xs = np.where(struct)
+    for y in range(h):
+        for x in range(w):
+            ok = True
+            for dy, dx in zip(ys - cy, xs - cx):
+                ny, nx = y + dy, x + dx
+                if not (0 <= ny < h and 0 <= nx < w and mask[ny, nx]):
+                    ok = False
+                    break
+            if ok:
+                out[y, x] = True
+    return out
+
+
+def image_to_ink_mask(img: Image.Image) -> np.ndarray:
+    """Máscara True donde hay tinta (líneas), independiente de fondo claro/oscuro."""
+    arr = np.array(img.convert("L"), dtype=np.uint8)
+    mean_value = float(np.mean(arr))
+    if mean_value > 127:
+        arr = 255 - arr
+    return arr >= 128
+
+
+def apply_outer_offset_contours(
+    base_img: Image.Image,
+    silhouette_source: Image.Image,
+    ref_axis: str,
+    ref_value_mm: float,
+    active_offsets_mm: list[float],
+    line_radius_px: int,
+) -> tuple[Image.Image, int]:
+    """Dibuja contornos de offset alrededor de la silueta exterior rellena.
+
+    Returns:
+        (imagen RGB o L con contornos, padding simétrico aplicado en píxeles).
+    """
+    if ref_value_mm <= 0 or not active_offsets_mm:
+        return base_img.convert("RGB") if base_img.mode != "RGB" else base_img.copy(), 0
+
+    dim_px = base_img.width if ref_axis == "width" else base_img.height
+    px_per_mm = dim_px / ref_value_mm
+
+    radii_px: list[int] = []
+    for d_mm in active_offsets_mm:
+        r = int(round(d_mm * px_per_mm))
+        if r >= 1:
+            radii_px.append(r)
+    if not radii_px:
+        rgb = base_img.convert("RGB") if base_img.mode != "RGB" else base_img.copy()
+        return rgb, 0
+
+    lr = max(1, int(line_radius_px))
+    max_r = max(radii_px)
+    pad = max_r + lr + 3
+
+    mask = image_to_ink_mask(silhouette_source)
+    if mask.shape != (base_img.height, base_img.width):
+        raise ValueError("La silueta y la imagen base deben tener el mismo tamaño")
+    solid = _binary_fill_holes(mask)
+
+    base_rgb = base_img.convert("RGB")
+    arr = np.array(base_rgb, dtype=np.uint8)
+    arr = np.pad(arr, ((pad, pad), (pad, pad), (0, 0)), mode="constant", constant_values=255)
+
+    solid_p = np.pad(solid, ((pad, pad), (pad, pad)), mode="constant", constant_values=False)
+
+    for r in sorted(set(radii_px), reverse=True):
+        dil = _binary_dilate(solid_p, r)
+        er = _binary_erode(dil, lr)
+        border = dil & (~er)
+        arr[border] = (0, 0, 0)
+
+    return Image.fromarray(arr, mode="RGB"), pad
+
+
 class ResultDialog(tk.Toplevel):
     """Diálogo para mostrar y gestionar el resultado de procesar desde portapapeles."""
     
@@ -198,6 +366,22 @@ class ResultDialog(tk.Toplevel):
         self._cached_blur_radius = None
         self._cached_thickened_image = None
         self._cached_blur_image = None
+        self._cached_offsets_image: Optional[Image.Image] = None
+        self._cached_offsets_key: Optional[tuple] = None
+        
+        # Offsets de contorno (silueta exterior)
+        self._offset_ref_axis_var = tk.StringVar(value="Ancho")
+        self._offset_ref_value_var = tk.StringVar(value="10.0")
+        self._offset_ref_unit_var = tk.StringVar(value="cm")
+        self._offset_dpi_var = tk.StringVar(value="300")
+        self._offset_line_px_var = tk.StringVar(value="2")
+        self._offset_enable_vars = [tk.BooleanVar(value=False) for _ in range(3)]
+        self._offset_mm_vars = [
+            tk.StringVar(value="1.0"),
+            tk.StringVar(value="2.0"),
+            tk.StringVar(value="4.0"),
+        ]
+        self._last_preview_image_size: Optional[tuple[int, int]] = None
         
         # Calcular dimensiones para la ventana
         max_preview_size = 600
@@ -242,7 +426,8 @@ class ResultDialog(tk.Toplevel):
         window_width = max(preview_width + 40, self.winfo_reqwidth())
         window_height = max(preview_height + 40, self.winfo_reqheight())
         self.geometry(f"{window_width}x{window_height}")
-        self.resizable(False, False)
+        self.resizable(True, True)
+        self.minsize(min(520, window_width), min(400, window_height))
         
         # Centrar en la pantalla
         self.update_idletasks()
@@ -330,6 +515,65 @@ class ResultDialog(tk.Toplevel):
         ).grid(row=0, column=2, sticky="e", padx=(0, 10), pady=8)
         blur_frame.columnconfigure(1, weight=1)
         
+        # Offsets de contorno (silueta exterior)
+        offset_frame = ttk.LabelFrame(self, text="Offsets de contorno (silueta exterior)")
+        offset_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(offset_frame, text="Escala física:").grid(
+            row=0, column=0, sticky="w", padx=10, pady=4
+        )
+        axis_cb = ttk.Combobox(
+            offset_frame,
+            textvariable=self._offset_ref_axis_var,
+            values=("Ancho", "Alto"),
+            width=8,
+            state="readonly",
+        )
+        axis_cb.grid(row=0, column=1, sticky="w", padx=(0, 6), pady=4)
+        axis_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_offset_change())
+        
+        ref_entry = ttk.Entry(offset_frame, textvariable=self._offset_ref_value_var, width=8)
+        ref_entry.grid(row=0, column=2, sticky="w", padx=(0, 6), pady=4)
+        ref_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
+        
+        unit_cb = ttk.Combobox(
+            offset_frame,
+            textvariable=self._offset_ref_unit_var,
+            values=("cm", "mm"),
+            width=5,
+            state="readonly",
+        )
+        unit_cb.grid(row=0, column=3, sticky="w", padx=(0, 6), pady=4)
+        unit_cb.bind("<<ComboboxSelected>>", lambda _e: self._on_offset_change())
+        
+        ttk.Label(offset_frame, text="DPI ref.:").grid(row=0, column=4, sticky="e", padx=(8, 4), pady=4)
+        dpi_entry = ttk.Entry(offset_frame, textvariable=self._offset_dpi_var, width=6)
+        dpi_entry.grid(row=0, column=5, sticky="w", padx=(0, 10), pady=4)
+        dpi_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
+        
+        ttk.Label(offset_frame, text="Grosor línea (px):").grid(
+            row=1, column=0, sticky="w", padx=10, pady=4
+        )
+        line_entry = ttk.Entry(offset_frame, textvariable=self._offset_line_px_var, width=6)
+        line_entry.grid(row=1, column=1, sticky="w", padx=(0, 6), pady=4)
+        line_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
+        
+        for i in range(3):
+            row = 2 + i
+            cb = ttk.Checkbutton(
+                offset_frame,
+                text=f"Offset {i + 1}:",
+                variable=self._offset_enable_vars[i],
+                command=self._on_offset_change,
+            )
+            cb.grid(row=row, column=0, sticky="w", padx=10, pady=2)
+            mm_entry = ttk.Entry(offset_frame, textvariable=self._offset_mm_vars[i], width=8)
+            mm_entry.grid(row=row, column=1, sticky="w", padx=(0, 4), pady=2, columnspan=2)
+            mm_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
+            ttk.Label(offset_frame, text="mm").grid(row=row, column=3, sticky="w", padx=(0, 10), pady=2)
+        
+        offset_frame.columnconfigure(2, weight=1)
+        
         # Controles de recorte y zoom
         crop_frame = ttk.Frame(self)
         crop_frame.pack(fill="x", padx=10, pady=5)
@@ -414,6 +658,112 @@ class ResultDialog(tk.Toplevel):
         except (TypeError, ValueError):
             return 0.0
     
+    def _on_offset_change(self, _event: object = None) -> None:
+        self._cached_offsets_image = None
+        self._cached_offsets_key = None
+        self._update_preview()
+    
+    def _parse_offset_params(self) -> dict:
+        """Parámetros de offsets para caché e info. ref_mm = longitud física del eje en mm."""
+        try:
+            ref_val = float(str(self._offset_ref_value_var.get()).replace(",", "."))
+        except (TypeError, ValueError):
+            ref_val = 0.0
+        unit = str(self._offset_ref_unit_var.get()).strip().lower()
+        ref_mm = ref_val * 10.0 if unit == "cm" else ref_val
+        axis = "width" if self._offset_ref_axis_var.get() == "Ancho" else "height"
+        
+        active: list[float] = []
+        for i in range(3):
+            if not self._offset_enable_vars[i].get():
+                continue
+            try:
+                mm = float(str(self._offset_mm_vars[i].get()).replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            if mm > 0:
+                active.append(mm)
+        
+        try:
+            line_px = int(round(float(str(self._offset_line_px_var.get()).replace(",", "."))))
+        except (TypeError, ValueError):
+            line_px = 2
+        
+        dpi_str = str(self._offset_dpi_var.get()).strip()
+        try:
+            dpi = float(dpi_str.replace(",", ".")) if dpi_str else 300.0
+        except (TypeError, ValueError):
+            dpi = 300.0
+        
+        key_tuple = (axis, ref_mm, tuple(active), max(1, line_px), dpi, ref_val, unit)
+        return {
+            "axis": axis,
+            "ref_mm": ref_mm,
+            "ref_val_raw": ref_val,
+            "unit": unit,
+            "active_list": active,
+            "line_px": max(1, line_px),
+            "dpi": dpi,
+            "key_tuple": key_tuple,
+            "ref_valid": ref_mm > 0,
+        }
+    
+    def _apply_offset_overlay_if_needed(
+        self,
+        base: Image.Image,
+        thickened: Image.Image,
+        percentage: float,
+        radius: float,
+    ) -> Image.Image:
+        params = self._parse_offset_params()
+        active = params["active_list"]
+        if not active or not params["ref_valid"]:
+            return base
+        
+        if thickened.size != base.size:
+            thickened = thickened.resize(base.size, Image.Resampling.NEAREST)
+        
+        key = (percentage, radius, params["key_tuple"], base.size)
+        if self._cached_offsets_image is not None and self._cached_offsets_key == key:
+            return self._cached_offsets_image
+        
+        try:
+            out, _pad = apply_outer_offset_contours(
+                base_img=base,
+                silhouette_source=thickened,
+                ref_axis=params["axis"],
+                ref_value_mm=params["ref_mm"],
+                active_offsets_mm=active,
+                line_radius_px=params["line_px"],
+            )
+        except Exception:
+            return base
+        
+        self._cached_offsets_image = out
+        self._cached_offsets_key = key
+        return out
+    
+    def _sync_crop_after_image_resize(
+        self,
+        prev_size: tuple[int, int],
+        new_size: tuple[int, int],
+    ) -> None:
+        """Mantiene el recorte coherente al cambiar el tamaño (p. ej. padding de offsets)."""
+        if self.crop_box is None:
+            return
+        x1, y1, x2, y2 = self.crop_box
+        pw, ph = prev_size
+        nw, nh = new_size
+        if x1 == 0 and y1 == 0 and x2 == pw and y2 == ph:
+            self.crop_box = (0, 0, nw, nh)
+            return
+        dw = (nw - pw) // 2
+        dh = (nh - ph) // 2
+        if dw == dh:
+            self.crop_box = (x1 + dw, y1 + dh, x2 + dw, y2 + dh)
+        else:
+            self.crop_box = (0, 0, nw, nh)
+    
     def _update_info_text(self, percentage: float, radius: float) -> None:
         crop_info = ""
         if self.crop_box is not None:
@@ -422,10 +772,26 @@ class ResultDialog(tk.Toplevel):
             height = y2 - y1
             crop_info = f" | Recorte: {width}×{height}px"
         
+        p = self._parse_offset_params()
+        off_info = ""
+        if p["active_list"]:
+            if p["ref_valid"]:
+                dim_px = (
+                    self.original_image.width if p["axis"] == "width" else self.original_image.height
+                )
+                px_per_mm = dim_px / p["ref_mm"]
+                dpi_eff = px_per_mm * 25.4
+                off_info = (
+                    f" | Offsets: {p['active_list']} mm | "
+                    f"px/mm≈{px_per_mm:.3f} (~{dpi_eff:.0f} dpi) | DPI ref: {p['dpi']:.0f}"
+                )
+            else:
+                off_info = " | Offsets activos: indica dimensión física > 0"
+        
         info_text = (
-            f"Imagen procesada: {self.original_image.width}×{self.original_image.height}px | "
+            f"Imagen original: {self.original_image.width}×{self.original_image.height}px | "
             f"Engrosamiento: {percentage:.0f}% | "
-            f"Desenfoque: {radius:.1f}px{crop_info}"
+            f"Desenfoque: {radius:.1f}px{off_info}{crop_info}"
         )
         self.info_var.set(info_text)
     
@@ -445,7 +811,6 @@ class ResultDialog(tk.Toplevel):
             self._cached_thicken_percentage = 0.0
             self._cached_thickened_image = None
         else:
-            # Usar caché si el porcentaje no ha cambiado
             if (
                 self._cached_thickened_image is not None
                 and self._cached_thicken_percentage == percentage
@@ -456,25 +821,28 @@ class ResultDialog(tk.Toplevel):
                 self._cached_thicken_percentage = percentage
                 self._cached_thickened_image = thickened
         
-        # Aplicar desenfoque después
+        # Desenfoque (opcional)
         if radius <= 0:
-            return thickened
+            base = thickened
+            self._cached_blur_image = None
+            self._cached_blur_radius = None
+        else:
+            if (
+                self._cached_blur_image is not None
+                and self._cached_blur_radius == radius
+                and self._cached_thicken_percentage == percentage
+            ):
+                base = self._cached_blur_image
+            else:
+                b = thickened
+                if b.mode == "1":
+                    b = b.convert("L")
+                blurred = b.filter(ImageFilter.GaussianBlur(radius))
+                self._cached_blur_radius = radius
+                self._cached_blur_image = blurred
+                base = blurred
         
-        # Usar caché si ambos valores no han cambiado
-        if (
-            self._cached_blur_image is not None
-            and self._cached_blur_radius == radius
-            and self._cached_thicken_percentage == percentage
-        ):
-            return self._cached_blur_image
-        
-        base = thickened
-        if base.mode == "1":
-            base = base.convert("L")
-        blurred = base.filter(ImageFilter.GaussianBlur(radius))
-        self._cached_blur_radius = radius
-        self._cached_blur_image = blurred
-        return blurred
+        return self._apply_offset_overlay_if_needed(base, thickened, percentage, radius)
     
     def _update_preview(self) -> None:
         percentage = self._get_thicken_percentage()
@@ -484,15 +852,29 @@ class ResultDialog(tk.Toplevel):
         self.blur_value_var.set(f"{radius:.1f} px")
         self._update_info_text(percentage, radius)
         
+        prev_size = self._last_preview_image_size
         current_img = self._get_current_image(percentage, radius)
+        new_size = (current_img.width, current_img.height)
+        if prev_size is not None and prev_size != new_size:
+            self._sync_crop_after_image_resize(prev_size, new_size)
+        self._last_preview_image_size = new_size
+        
+        # Si el recorte sigue siendo "toda la imagen original" pero la salida es más grande (offsets), ampliar.
+        ow, oh = self._original_size
+        if self.crop_box is not None:
+            cx1, cy1, cx2, cy2 = self.crop_box
+            if cx1 == 0 and cy1 == 0 and cx2 == ow and cy2 == oh:
+                if cx2 != new_size[0] or cy2 != new_size[1]:
+                    self.crop_box = (0, 0, new_size[0], new_size[1])
         
         # Usar zoom manual: escala base multiplicada por el nivel de zoom
         img_width, img_height = current_img.width, current_img.height
+        self._current_display_size = (img_width, img_height)
         display_scale = self._base_scale * self._zoom_level
         
-        # Tamaño fijo del canvas
-        base_canvas_width = int(self._original_size[0] * self._base_scale) + 20
-        base_canvas_height = int(self._original_size[1] * self._base_scale) + 20
+        # Tamaño del canvas: cabe la imagen original o la procesada (p. ej. con padding de offsets)
+        base_canvas_width = int(max(ow, img_width) * self._base_scale) + 20
+        base_canvas_height = int(max(oh, img_height) * self._base_scale) + 20
         canvas_width = max(base_canvas_width, 100)
         canvas_height = max(base_canvas_height, 100)
         self.preview_canvas.config(width=canvas_width, height=canvas_height)
@@ -564,9 +946,13 @@ class ResultDialog(tk.Toplevel):
     def _on_thicken_change(self, _value: str) -> None:
         # Invalidar caché cuando cambia el engrosamiento
         self._cached_blur_image = None
+        self._cached_offsets_image = None
+        self._cached_offsets_key = None
         self._update_preview()
     
     def _on_blur_change(self, _value: str) -> None:
+        self._cached_offsets_image = None
+        self._cached_offsets_key = None
         self._update_preview()
     
     def _zoom_out(self) -> None:
@@ -607,8 +993,8 @@ class ResultDialog(tk.Toplevel):
     
     def _clear_crop(self) -> None:
         """Restablece la selección de recorte a toda la imagen."""
-        # Restablecer a toda la imagen
-        self.crop_box = (0, 0, self._original_size[0], self._original_size[1])
+        cur = self._get_current_image()
+        self.crop_box = (0, 0, cur.width, cur.height)
         self._crop_start = None
         self._active_handle = None
         self._drag_mode = None
@@ -1062,8 +1448,9 @@ class ResultDialog(tk.Toplevel):
         # Calcular las coordenadas de la imagen en el canvas
         img_canvas_x1 = center_offset[0]
         img_canvas_y1 = center_offset[1]
-        img_canvas_x2 = img_canvas_x1 + int(self._original_size[0] * scale)
-        img_canvas_y2 = img_canvas_y1 + int(self._original_size[1] * scale)
+        disp_w, disp_h = getattr(self, "_current_display_size", self._original_size)
+        img_canvas_x2 = img_canvas_x1 + int(disp_w * scale)
+        img_canvas_y2 = img_canvas_y1 + int(disp_h * scale)
         
         # Dibujar fondo de cuadros en las áreas del crop_box que están fuera de la imagen
         # Área izquierda del crop_box fuera de la imagen

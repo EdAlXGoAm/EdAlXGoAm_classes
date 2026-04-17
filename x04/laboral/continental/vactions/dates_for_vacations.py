@@ -34,9 +34,9 @@ def generar_tabla_vacaciones(fecha_inicio, fecha_fin, dias_vacaciones, nombre_ar
 # EJEMPLO DE USO
 # =========================
 if __name__ == "__main__":
-    fecha_inicio = "2025-12-11"
-    fecha_fin = "2026-12-10"
-    dias_vacaciones = 16
+    fecha_inicio = "2025-04-04"
+    fecha_fin = "2026-04-03"
+    dias_vacaciones = 18
     nombre_archivo = "generacion_vacaciones.xlsx"
 
     generar_tabla_vacaciones(
