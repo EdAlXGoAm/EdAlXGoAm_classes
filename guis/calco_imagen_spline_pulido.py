@@ -257,13 +257,56 @@ def trace_with_potrace(
     # Convertir a SVG
     svg_content = potrace_path_to_svg(path, original_width, original_height, scale_down_x, scale_down_y)
     
-    # Convertir a puntos para SPLINE en DXF (curvas suaves reales)
-    spline_points = potrace_path_to_spline_points(path, height, scale_down_x, scale_down_y)
+    # Convertir a segmentos estructurados (líneas + bezier) para DXF exacto
+    curve_segments = potrace_path_to_segments(path, height, scale_down_x, scale_down_y)
 
     # Polilíneas densas para preview (muestran suavidad)
     preview_polylines = potrace_path_to_polylines(path, height, settings.detail_level, scale_down_x, scale_down_y)
     
-    return svg_content, spline_points, preview_polylines
+    return svg_content, curve_segments, preview_polylines
+
+
+def potrace_path_to_segments(
+    path,
+    height: int,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> List[List[tuple]]:
+    """
+    Convierte un path de Potrace a una lista de curvas; cada curva es una
+    lista de segmentos tipados:
+        ('L', p0, p1)                     -> segmento recto
+        ('B', p0, p1, p2, p3)             -> Bézier cúbico
+    Esto permite generar DXF con LINE reales (sin combarlas como SPLINE).
+    """
+    curves = []
+    for curve in path:
+        segs = []
+        start = (
+            curve.start_point.x * scale_x,
+            (height - curve.start_point.y) * scale_y,
+        )
+        cp = start
+        for segment in curve:
+            if segment.is_corner:
+                c = (segment.c.x * scale_x, (height - segment.c.y) * scale_y)
+                end = (segment.end_point.x * scale_x, (height - segment.end_point.y) * scale_y)
+                segs.append(('L', cp, c))
+                segs.append(('L', c, end))
+                cp = end
+            else:
+                p0 = cp
+                p1 = (segment.c1.x * scale_x, (height - segment.c1.y) * scale_y)
+                p2 = (segment.c2.x * scale_x, (height - segment.c2.y) * scale_y)
+                p3 = (segment.end_point.x * scale_x, (height - segment.end_point.y) * scale_y)
+                segs.append(('B', p0, p1, p2, p3))
+                cp = p3
+        # Cerrar contorno con línea recta si no volvió al inicio
+        if segs and (abs(cp[0] - start[0]) > 1e-9 or abs(cp[1] - start[1]) > 1e-9):
+            segs.append(('L', cp, start))
+        if segs:
+            curves.append(segs)
+    return curves
 
 
 def potrace_path_to_svg(
@@ -542,7 +585,19 @@ def contours_to_dxf_entities(contours: List[np.ndarray], settings: TraceSettings
     return polylines
 
 
-def generate_dxf_ezdxf(polylines: List[List[Tuple[float, float]]], width: int, height: int, 
+def _is_segments_format(data) -> bool:
+    """Detecta si `data` viene como lista de curvas en formato segmentos
+    (lista de tuplas ('L'|'B', ...)) o como polilíneas (lista de puntos)."""
+    if not data:
+        return False
+    first_curve = data[0]
+    if not first_curve:
+        return False
+    first_item = first_curve[0]
+    return isinstance(first_item, tuple) and len(first_item) >= 2 and first_item[0] in ('L', 'B')
+
+
+def generate_dxf_ezdxf(polylines, width: int, height: int,
                        scale: float = 1.0, width_cm: float = 0.0, height_cm: float = 0.0,
                        use_spline: bool = True) -> bytes:
     """Genera archivo DXF usando ezdxf (formato R2000, compatible con Fusion 360).
@@ -579,23 +634,53 @@ def generate_dxf_ezdxf(polylines: List[List[Tuple[float, float]]], width: int, h
     final_width = width_cm if width_cm > 0 else width * scale
     final_height = height_cm if height_cm > 0 else height * scale
     
-    # Añadir cada curva
-    for curve_points in polylines:
-        if len(curve_points) < 2:
-            continue
-        
-        # Escalar puntos a cm si es necesario
-        scaled_points = [(x * scale, y * scale) for x, y in curve_points]
-        
-        if use_spline:
-            # Usar SPLINE para curvas suaves matemáticas
-            # Los puntos son "fit points" - la curva pasará por ellos
-            # Añadir el primer punto al final para cerrar la curva
-            closed_points = scaled_points + [scaled_points[0]]
-            msp.add_spline(closed_points, degree=3)
-        else:
-            # Fallback: usar LWPOLYLINE (polilíneas discretas)
-            msp.add_lwpolyline(scaled_points, close=True)
+    segments_mode = use_spline and _is_segments_format(polylines)
+
+    if segments_mode:
+        # Emitir LINE para tramos rectos y SPLINE (Bezier cúbico exacto) para curvas.
+        # Así las líneas rectas se mantienen rectas en Fusion 360.
+        for curve_segs in polylines:
+            for seg in curve_segs:
+                kind = seg[0]
+                if kind == 'L':
+                    p0 = (seg[1][0] * scale, seg[1][1] * scale)
+                    p1 = (seg[2][0] * scale, seg[2][1] * scale)
+                    if abs(p0[0] - p1[0]) < 1e-9 and abs(p0[1] - p1[1]) < 1e-9:
+                        continue
+                    msp.add_line(p0, p1)
+                elif kind == 'B':
+                    ctrl_pts = [
+                        (seg[1][0] * scale, seg[1][1] * scale),
+                        (seg[2][0] * scale, seg[2][1] * scale),
+                        (seg[3][0] * scale, seg[3][1] * scale),
+                        (seg[4][0] * scale, seg[4][1] * scale),
+                    ]
+                    try:
+                        # Representación exacta de un Bézier cúbico como B-spline abierto:
+                        # degree=3 con 4 puntos de control y knots [0,0,0,0,1,1,1,1].
+                        msp.add_open_spline(ctrl_pts, degree=3)
+                    except Exception:
+                        # Fallback: usar fit points sobre la bezier
+                        p0, p1, p2, p3 = ctrl_pts
+                        fit = [p0]
+                        for t in (0.25, 0.5, 0.75):
+                            x = (1-t)**3*p0[0] + 3*(1-t)**2*t*p1[0] + 3*(1-t)*t**2*p2[0] + t**3*p3[0]
+                            y = (1-t)**3*p0[1] + 3*(1-t)**2*t*p1[1] + 3*(1-t)*t**2*p2[1] + t**3*p3[1]
+                            fit.append((x, y))
+                        fit.append(p3)
+                        msp.add_spline(fit, degree=3)
+    else:
+        for curve_points in polylines:
+            if len(curve_points) < 2:
+                continue
+
+            scaled_points = [(x * scale, y * scale) for x, y in curve_points]
+
+            if use_spline:
+                closed_points = scaled_points + [scaled_points[0]]
+                msp.add_spline(closed_points, degree=3)
+            else:
+                msp.add_lwpolyline(scaled_points, close=True)
     
     # Configurar los límites del dibujo (ayuda a Fusion 360 a interpretar el tamaño)
     doc.header['$EXTMIN'] = (0, 0, 0)
@@ -610,7 +695,7 @@ def generate_dxf_ezdxf(polylines: List[List[Tuple[float, float]]], width: int, h
     return stream.getvalue().encode('utf-8')
 
 
-def generate_dxf(polylines: List[List[Tuple[float, float]]], width: int, height: int, 
+def generate_dxf(polylines, width: int, height: int,
                  scale: float = 1.0, width_cm: float = 0.0, height_cm: float = 0.0,
                  use_spline: bool = True) -> bytes:
     """Genera archivo DXF compatible con Fusion 360.
