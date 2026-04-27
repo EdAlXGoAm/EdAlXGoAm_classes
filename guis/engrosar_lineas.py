@@ -303,32 +303,36 @@ def apply_outer_offset_contours(
     silhouette_source: Image.Image,
     ref_axis: str,
     ref_value_mm: float,
-    active_offsets_mm: list[float],
-    line_radius_px: int,
+    active_offsets: list[tuple[float, float]],
 ) -> tuple[Image.Image, int]:
     """Dibuja contornos de offset alrededor de la silueta exterior rellena.
 
+    Args:
+        active_offsets: lista de (distancia_mm, grosor_mm). La distancia es
+            la separación entre la silueta y el borde interno de la línea
+            (línea siempre dibujada hacia afuera).
+
     Returns:
-        (imagen RGB o L con contornos, padding simétrico aplicado en píxeles).
+        (imagen RGB con contornos, padding simétrico aplicado en píxeles).
     """
-    if ref_value_mm <= 0 or not active_offsets_mm:
+    if ref_value_mm <= 0 or not active_offsets:
         return base_img.convert("RGB") if base_img.mode != "RGB" else base_img.copy(), 0
 
     dim_px = base_img.width if ref_axis == "width" else base_img.height
     px_per_mm = dim_px / ref_value_mm
 
-    radii_px: list[int] = []
-    for d_mm in active_offsets_mm:
-        r = int(round(d_mm * px_per_mm))
-        if r >= 1:
-            radii_px.append(r)
-    if not radii_px:
+    bands_px: list[tuple[int, int]] = []
+    for dist_mm, thick_mm in active_offsets:
+        r_in = max(0, int(round(dist_mm * px_per_mm)))
+        r_out = int(round((dist_mm + thick_mm) * px_per_mm))
+        if r_out > r_in:
+            bands_px.append((r_in, r_out))
+    if not bands_px:
         rgb = base_img.convert("RGB") if base_img.mode != "RGB" else base_img.copy()
         return rgb, 0
 
-    lr = max(1, int(line_radius_px))
-    max_r = max(radii_px)
-    pad = max_r + lr + 3
+    max_r = max(r_out for _, r_out in bands_px)
+    pad = max_r + 3
 
     mask = image_to_ink_mask(silhouette_source)
     if mask.shape != (base_img.height, base_img.width):
@@ -341,11 +345,18 @@ def apply_outer_offset_contours(
 
     solid_p = np.pad(solid, ((pad, pad), (pad, pad)), mode="constant", constant_values=False)
 
-    for r in sorted(set(radii_px), reverse=True):
-        dil = _binary_dilate(solid_p, r)
-        er = _binary_erode(dil, lr)
-        border = dil & (~er)
-        arr[border] = (0, 0, 0)
+    dilation_cache: dict[int, np.ndarray] = {0: solid_p}
+
+    def _dil(r: int) -> np.ndarray:
+        if r not in dilation_cache:
+            dilation_cache[r] = _binary_dilate(solid_p, r) if r > 0 else solid_p
+        return dilation_cache[r]
+
+    for r_in, r_out in sorted(bands_px, key=lambda b: b[1], reverse=True):
+        outer = _dil(r_out)
+        inner = _dil(r_in)
+        band = outer & (~inner)
+        arr[band] = (0, 0, 0)
 
     return Image.fromarray(arr, mode="RGB"), pad
 
@@ -374,12 +385,14 @@ class ResultDialog(tk.Toplevel):
         self._offset_ref_value_var = tk.StringVar(value="10.0")
         self._offset_ref_unit_var = tk.StringVar(value="cm")
         self._offset_dpi_var = tk.StringVar(value="300")
-        self._offset_line_px_var = tk.StringVar(value="2")
-        self._offset_enable_vars = [tk.BooleanVar(value=False) for _ in range(3)]
-        self._offset_mm_vars = [
+        self._offset_enable_vars = [tk.BooleanVar(value=False) for _ in range(2)]
+        self._offset_dist_mm_vars = [
+            tk.StringVar(value="1.0"),
+            tk.StringVar(value="4.0"),
+        ]
+        self._offset_thick_mm_vars = [
             tk.StringVar(value="1.0"),
             tk.StringVar(value="2.0"),
-            tk.StringVar(value="4.0"),
         ]
         self._last_preview_image_size: Optional[tuple[int, int]] = None
         
@@ -440,8 +453,47 @@ class ResultDialog(tk.Toplevel):
         self.grab_set()
     
     def _build_ui(self) -> None:
+        # Contenedor con scrollbar vertical para que el contenido sea desplazable
+        # cuando no quepa en la altura de la ventana.
+        outer = ttk.Frame(self)
+        outer.pack(fill="both", expand=True)
+        
+        self._scroll_canvas = tk.Canvas(outer, borderwidth=0, highlightthickness=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=self._scroll_canvas.yview)
+        self._scroll_canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        self._scroll_canvas.pack(side="left", fill="both", expand=True)
+        
+        inner = ttk.Frame(self._scroll_canvas)
+        self._inner_frame = inner
+        self._inner_window_id = self._scroll_canvas.create_window(
+            (0, 0), window=inner, anchor="nw"
+        )
+        
+        def _on_inner_configure(_e: object) -> None:
+            self._scroll_canvas.configure(scrollregion=self._scroll_canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+        
+        def _on_canvas_configure(e: tk.Event) -> None:
+            # Hacer que el frame interior siga el ancho del canvas (scroll solo vertical).
+            self._scroll_canvas.itemconfigure(self._inner_window_id, width=e.width)
+        self._scroll_canvas.bind("<Configure>", _on_canvas_configure)
+        
+        # Rueda del ratón: activa scroll solo cuando el cursor está fuera del preview
+        # para no interferir con interacciones del lienzo de imagen.
+        def _on_mousewheel(e: tk.Event) -> str:
+            self._scroll_canvas.yview_scroll(int(-e.delta / 120), "units")
+            return "break"
+        def _bind_wheel(_e: object) -> None:
+            self._scroll_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+        def _unbind_wheel(_e: object) -> None:
+            self._scroll_canvas.unbind_all("<MouseWheel>")
+        self._scroll_canvas.bind("<Enter>", _bind_wheel)
+        self._scroll_canvas.bind("<Leave>", _unbind_wheel)
+        self.bind("<Destroy>", lambda _e: self._scroll_canvas.unbind_all("<MouseWheel>"))
+        
         # Información
-        info_frame = ttk.Frame(self)
+        info_frame = ttk.Frame(inner)
         info_frame.pack(fill="x", padx=10, pady=(10, 5))
         
         ttk.Label(
@@ -451,7 +503,7 @@ class ResultDialog(tk.Toplevel):
         ).pack()
         
         # Preview de la imagen
-        preview_frame = ttk.LabelFrame(self, text="Vista previa (arrastra para seleccionar, usa los puntos azules para ajustar)")
+        preview_frame = ttk.LabelFrame(inner, text="Vista previa (arrastra para seleccionar, usa los puntos azules para ajustar)")
         preview_frame.pack(fill="both", expand=True, padx=10, pady=5)
         
         # Usar Canvas en lugar de Label para permitir selección de área
@@ -470,7 +522,7 @@ class ResultDialog(tk.Toplevel):
         self.preview_canvas.bind("<Motion>", self._on_crop_motion)
         
         # Controles de engrosamiento
-        thicken_frame = ttk.LabelFrame(self, text="Engrosamiento")
+        thicken_frame = ttk.LabelFrame(inner, text="Engrosamiento")
         thicken_frame.pack(fill="x", padx=10, pady=5)
         
         ttk.Label(thicken_frame, text="Porcentaje:").grid(
@@ -493,7 +545,7 @@ class ResultDialog(tk.Toplevel):
         thicken_frame.columnconfigure(1, weight=1)
         
         # Controles de desenfoque
-        blur_frame = ttk.LabelFrame(self, text="Desenfoque gaussiano")
+        blur_frame = ttk.LabelFrame(inner, text="Desenfoque gaussiano")
         blur_frame.pack(fill="x", padx=10, pady=5)
         
         ttk.Label(blur_frame, text="Radio (px):").grid(
@@ -516,7 +568,7 @@ class ResultDialog(tk.Toplevel):
         blur_frame.columnconfigure(1, weight=1)
         
         # Offsets de contorno (silueta exterior)
-        offset_frame = ttk.LabelFrame(self, text="Offsets de contorno (silueta exterior)")
+        offset_frame = ttk.LabelFrame(inner, text="Offsets de contorno (silueta exterior)")
         offset_frame.pack(fill="x", padx=10, pady=5)
         
         ttk.Label(offset_frame, text="Escala física:").grid(
@@ -551,14 +603,11 @@ class ResultDialog(tk.Toplevel):
         dpi_entry.grid(row=0, column=5, sticky="w", padx=(0, 10), pady=4)
         dpi_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
         
-        ttk.Label(offset_frame, text="Grosor línea (px):").grid(
-            row=1, column=0, sticky="w", padx=10, pady=4
-        )
-        line_entry = ttk.Entry(offset_frame, textvariable=self._offset_line_px_var, width=6)
-        line_entry.grid(row=1, column=1, sticky="w", padx=(0, 6), pady=4)
-        line_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
-        
-        for i in range(3):
+        # Cabecera de columnas para los offsets
+        ttk.Label(offset_frame, text="Distancia").grid(row=1, column=2, sticky="w", padx=(0, 4), pady=(4, 0))
+        ttk.Label(offset_frame, text="Grosor").grid(row=1, column=4, sticky="w", padx=(0, 4), pady=(4, 0))
+
+        for i in range(2):
             row = 2 + i
             cb = ttk.Checkbutton(
                 offset_frame,
@@ -566,16 +615,22 @@ class ResultDialog(tk.Toplevel):
                 variable=self._offset_enable_vars[i],
                 command=self._on_offset_change,
             )
-            cb.grid(row=row, column=0, sticky="w", padx=10, pady=2)
-            mm_entry = ttk.Entry(offset_frame, textvariable=self._offset_mm_vars[i], width=8)
-            mm_entry.grid(row=row, column=1, sticky="w", padx=(0, 4), pady=2, columnspan=2)
-            mm_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
+            cb.grid(row=row, column=0, sticky="w", padx=10, pady=2, columnspan=2)
+
+            dist_entry = ttk.Entry(offset_frame, textvariable=self._offset_dist_mm_vars[i], width=8)
+            dist_entry.grid(row=row, column=2, sticky="w", padx=(0, 4), pady=2)
+            dist_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
             ttk.Label(offset_frame, text="mm").grid(row=row, column=3, sticky="w", padx=(0, 10), pady=2)
-        
-        offset_frame.columnconfigure(2, weight=1)
+
+            thick_entry = ttk.Entry(offset_frame, textvariable=self._offset_thick_mm_vars[i], width=8)
+            thick_entry.grid(row=row, column=4, sticky="w", padx=(0, 4), pady=2)
+            thick_entry.bind("<KeyRelease>", lambda _e: self._on_offset_change())
+            ttk.Label(offset_frame, text="mm").grid(row=row, column=5, sticky="w", padx=(0, 10), pady=2)
+
+        offset_frame.columnconfigure(6, weight=1)
         
         # Controles de recorte y zoom
-        crop_frame = ttk.Frame(self)
+        crop_frame = ttk.Frame(inner)
         crop_frame.pack(fill="x", padx=10, pady=5)
         
         ttk.Checkbutton(
@@ -625,7 +680,7 @@ class ResultDialog(tk.Toplevel):
         ).pack(side="left", padx=(2, 10))
         
         # Botones de acción
-        btn_frame = ttk.Frame(self)
+        btn_frame = ttk.Frame(inner)
         btn_frame.pack(fill="x", padx=10, pady=(5, 10))
         
         ttk.Button(
@@ -673,21 +728,20 @@ class ResultDialog(tk.Toplevel):
         ref_mm = ref_val * 10.0 if unit == "cm" else ref_val
         axis = "width" if self._offset_ref_axis_var.get() == "Ancho" else "height"
         
-        active: list[float] = []
-        for i in range(3):
+        active: list[tuple[float, float]] = []
+        for i in range(2):
             if not self._offset_enable_vars[i].get():
                 continue
             try:
-                mm = float(str(self._offset_mm_vars[i].get()).replace(",", "."))
+                dist_mm = float(str(self._offset_dist_mm_vars[i].get()).replace(",", "."))
             except (TypeError, ValueError):
                 continue
-            if mm > 0:
-                active.append(mm)
-        
-        try:
-            line_px = int(round(float(str(self._offset_line_px_var.get()).replace(",", "."))))
-        except (TypeError, ValueError):
-            line_px = 2
+            try:
+                thick_mm = float(str(self._offset_thick_mm_vars[i].get()).replace(",", "."))
+            except (TypeError, ValueError):
+                continue
+            if dist_mm >= 0 and thick_mm > 0:
+                active.append((dist_mm, thick_mm))
         
         dpi_str = str(self._offset_dpi_var.get()).strip()
         try:
@@ -695,14 +749,13 @@ class ResultDialog(tk.Toplevel):
         except (TypeError, ValueError):
             dpi = 300.0
         
-        key_tuple = (axis, ref_mm, tuple(active), max(1, line_px), dpi, ref_val, unit)
+        key_tuple = (axis, ref_mm, tuple(active), dpi, ref_val, unit)
         return {
             "axis": axis,
             "ref_mm": ref_mm,
             "ref_val_raw": ref_val,
             "unit": unit,
             "active_list": active,
-            "line_px": max(1, line_px),
             "dpi": dpi,
             "key_tuple": key_tuple,
             "ref_valid": ref_mm > 0,
@@ -733,8 +786,7 @@ class ResultDialog(tk.Toplevel):
                 silhouette_source=thickened,
                 ref_axis=params["axis"],
                 ref_value_mm=params["ref_mm"],
-                active_offsets_mm=active,
-                line_radius_px=params["line_px"],
+                active_offsets=active,
             )
         except Exception:
             return base
@@ -781,8 +833,11 @@ class ResultDialog(tk.Toplevel):
                 )
                 px_per_mm = dim_px / p["ref_mm"]
                 dpi_eff = px_per_mm * 25.4
+                off_str = ", ".join(
+                    f"{d:g}mm@{t:g}mm" for d, t in p["active_list"]
+                )
                 off_info = (
-                    f" | Offsets: {p['active_list']} mm | "
+                    f" | Offsets (dist@grosor): {off_str} | "
                     f"px/mm≈{px_per_mm:.3f} (~{dpi_eff:.0f} dpi) | DPI ref: {p['dpi']:.0f}"
                 )
             else:
