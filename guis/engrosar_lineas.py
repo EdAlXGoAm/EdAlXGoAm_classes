@@ -78,7 +78,8 @@ def thicken_lines_image(img: Image.Image, percentage: float) -> Image.Image:
     # Calcular el tamaño del kernel de dilatación basado en el porcentaje
     # El porcentaje se interpreta como un factor multiplicativo
     # Por ejemplo, 150% significa engrosar 1.5 veces más
-    width, height = img_array.shape
+    # PIL/numpy: el array es (filas, columnas) == (altura, ancho)
+    height, width = img_array.shape
     min_dimension = min(width, height)
     
     # El radio base es una fracción pequeña de la dimensión mínima

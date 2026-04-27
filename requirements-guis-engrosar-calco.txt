@@ -1,0 +1,21 @@
+# Dependencias pip para:
+#   - guis/engrosar_lineas.py
+#   - guis/calco_imagen_spline_pulido.py
+#
+# tkinter: viene con el instalador oficial de Python en Windows.
+# En Linux (Debian/Ubuntu): sudo apt install python3-tk
+#
+# Instalación: pip install -r requirements-guis-engrosar-calco.txt
+
+# Comunes a ambos scripts
+Pillow>=10.0.0
+numpy>=1.24.0
+
+# guis/engrosar_lineas.py (dilatación morfológica; sin scipy se usa fallback numpy más lento)
+scipy>=1.10.0
+
+# calco_imagen_spline_pulido.py (el script funciona sin ellos pero con advertencias;
+# conviene instalarlos para rendimiento completo, DXF y vectorización potrace)
+opencv-python>=4.8.0
+ezdxf>=1.0.0
+potracer>=0.0.4
